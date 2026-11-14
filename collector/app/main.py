@@ -48,6 +48,8 @@ def _job_response(conn: sqlite3.Connection, row: sqlite3.Row) -> JobResponse:
         source_url=row["source_url"],
         interval_start=row["interval_start"],
         interval_end=row["interval_end"],
+        after_seq=row["after_seq"],
+        snapshot_seq=row["snapshot_seq"],
         status=row["status"],
         cursor=row["cursor"],
         next_offset=row["next_offset"],
@@ -103,7 +105,10 @@ def create_job(req: CreateJobRequest) -> JobResponse:
         if start > end:
             raise HTTPException(status_code=422, detail="start must be <= end")
 
-        job_id = db.create_job(conn, source_url, start, end)
+        # Arrival-watermark baseline: events with seq above this value are
+        # caught even when their changed_at falls inside an old interval.
+        after_seq = int(state["watermark_seq"] or 0)
+        job_id = db.create_job(conn, source_url, start, end, after_seq)
         conn.commit()
         row = db.get_job(conn, job_id)
         response = _job_response(conn, row)
@@ -169,6 +174,7 @@ def get_sync_state() -> StateResponse:
             last_start=row["last_start"],
             last_end=row["last_end"],
             completed_at=row["completed_at"],
+            watermark_seq=row["watermark_seq"],
         )
     finally:
         conn.close()

@@ -4,6 +4,10 @@ Each event is an append-only, never-rewritten change record. The source
 returns these records from a closed [start, end] interval in pages; the same
 event may appear more than once and page order is not globally sorted, so
 collectors must dedupe and keep the highest revision per paper.
+
+``changed_at`` is the repository-side *change time* (which can lie in an old
+interval when the event is delivered late); the monotonically increasing
+arrival sequence is assigned by the service at ingestion time, not here.
 """
 from __future__ import annotations
 
@@ -62,4 +66,20 @@ APPENDED_EVENTS: list[dict] = [
      "authors": "D. Zhao; E. Sun", "is_retracted": 1, "changed_at": "2026-11-10T15:00:00Z"},
     {"paper_id": "P0002", "rev": 2, "title": "Open Access Discovery Interfaces",
      "authors": "D. Zhao; E. Sun", "is_retracted": 0, "changed_at": "2026-11-03T11:20:00Z"},
+]
+
+# Late-arriving batch: the retraction's *change time* is inside an interval
+# the collector has already finished, but it only arrives at the source
+# afterwards. Pure time-window incremental sync would miss it forever; the
+# arrival-watermark catch-up window is what brings it home. A regular
+# in-window new paper rides along in the same batch.
+LATE_BATCH_EVENTS: list[dict] = [
+    {"paper_id": "P0004", "rev": 2,
+     "title": "Long-Term Preservation of Dataset Metadata (retracted)",
+     "authors": "G. Kim; H. Ito", "is_retracted": 1,
+     "changed_at": "2026-11-04T12:00:00Z"},
+    {"paper_id": "P0008", "rev": 1,
+     "title": "Controlled Vocabularies for Research Information Systems",
+     "authors": "M. Park", "is_retracted": 0,
+     "changed_at": "2026-11-09T08:00:00Z"},
 ]

@@ -5,10 +5,16 @@ Design points:
 * Every fetched page is persisted together with its resumption cursor in the
   same transaction, so a crash/restart can resume from the last durable page.
 * Staged rows of one job stay invisible to query clients; they only become
-  visible when the *whole* closed interval is complete and a single atomic
-  transaction publishes them together with the new completed time.
+  visible when the *whole* feed is complete and a single atomic transaction
+  publishes them together with the new completed time and arrival watermark.
 * Retraction is sticky in the committed ``papers`` table: once a paper is
   retracted, an older non-retracted revision can never undo it.
+* Two independent sync baselines are tracked:
+    - ``completed_at``: the closed interval end (change-time baseline);
+    - ``watermark_seq``: the highest *arrival* sequence already published,
+      used to catch late-arriving events whose changed_at is in an old window.
+  The published watermark is the feed's pinned snapshot, never the source's
+  live watermark, so events arriving while paging cannot be skipped.
 """
 from __future__ import annotations
 
@@ -22,11 +28,12 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS sync_state (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    source_url  TEXT NOT NULL,
-    last_start  TEXT,
-    last_end    TEXT,
-    completed_at TEXT
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    source_url    TEXT NOT NULL,
+    last_start    TEXT,
+    last_end      TEXT,
+    completed_at  TEXT,
+    watermark_seq INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -34,6 +41,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     source_url       TEXT NOT NULL,
     interval_start   TEXT NOT NULL,
     interval_end     TEXT NOT NULL,
+    after_seq        INTEGER NOT NULL DEFAULT 0,
+    snapshot_seq     INTEGER,
     status           TEXT NOT NULL CHECK (status IN
                        ('collecting','committing','completed','failed','interrupted')),
     cursor           TEXT,
@@ -54,6 +63,7 @@ CREATE TABLE IF NOT EXISTS staged_changes (
     authors       TEXT NOT NULL,
     is_retracted  INTEGER NOT NULL,
     changed_at    TEXT NOT NULL,
+    seq           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, paper_id)
 );
 
@@ -91,8 +101,8 @@ def init_db(db_path: str | None = None) -> None:
         try:
             conn.executescript(SCHEMA)
             conn.execute(
-                "INSERT OR IGNORE INTO sync_state (id, source_url, completed_at) "
-                "VALUES (1, '', NULL)"
+                "INSERT OR IGNORE INTO sync_state (id, source_url, completed_at, watermark_seq) "
+                "VALUES (1, '', NULL, 0)"
             )
             # A process killed mid-sync leaves jobs marked collecting: on
             # restart they become explicitly resumable as 'interrupted'.
@@ -128,12 +138,14 @@ def get_state(conn: sqlite3.Connection) -> sqlite3.Row:
 # jobs
 # --------------------------------------------------------------------------- #
 def create_job(conn: sqlite3.Connection, source_url: str,
-               interval_start: str, interval_end: str) -> int:
+               interval_start: str, interval_end: str,
+               after_seq: int) -> int:
     now = utc_now_iso()
     cur = conn.execute(
-        "INSERT INTO jobs (source_url, interval_start, interval_end, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, 'collecting', ?, ?)",
-        (source_url, interval_start, interval_end, now, now),
+        "INSERT INTO jobs (source_url, interval_start, interval_end, after_seq, "
+        "status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 'collecting', ?, ?)",
+        (source_url, interval_start, interval_end, after_seq, now, now),
     )
     return int(cur.lastrowid)
 
@@ -155,11 +167,13 @@ def has_active_job(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def update_cursor(conn: sqlite3.Connection, job_id: int, cursor: str | None,
-                  next_offset: int, pages_fetched: int, fetch_done: bool) -> None:
+                  next_offset: int, pages_fetched: int, fetch_done: bool,
+                  snapshot_seq: int | None) -> None:
     conn.execute(
-        "UPDATE jobs SET cursor=?, next_offset=?, pages_fetched=?, fetch_done=?, updated_at=? "
-        "WHERE id=?",
-        (cursor, next_offset, pages_fetched, int(fetch_done), utc_now_iso(), job_id),
+        "UPDATE jobs SET cursor=?, next_offset=?, pages_fetched=?, fetch_done=?, "
+        "snapshot_seq=COALESCE(?, snapshot_seq), updated_at=? WHERE id=?",
+        (cursor, next_offset, pages_fetched, int(fetch_done),
+         snapshot_seq, utc_now_iso(), job_id),
     )
 
 
@@ -172,9 +186,11 @@ def mark_status(conn: sqlite3.Connection, job_id: int, status: str,
 
 
 def increment_cursor_resets(conn: sqlite3.Connection, job_id: int) -> int:
+    # Reset only the pagination position. The ORIGINAL interval and after_seq
+    # watermark baseline are preserved, so re-fetch covers the same predicate.
     conn.execute(
         "UPDATE jobs SET cursor_resets=cursor_resets+1, cursor=NULL, next_offset=0, "
-        "pages_fetched=0, fetch_done=0, updated_at=? WHERE id=?",
+        "pages_fetched=0, fetch_done=0, snapshot_seq=NULL, updated_at=? WHERE id=?",
         (utc_now_iso(), job_id),
     )
     row = conn.execute("SELECT cursor_resets FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -189,8 +205,8 @@ def upsert_staged(conn: sqlite3.Connection, job_id: int, event: dict) -> None:
     conn.execute(
         """
         INSERT INTO staged_changes
-            (job_id, paper_id, rev, title, authors, is_retracted, changed_at)
-        VALUES (:job_id, :paper_id, :rev, :title, :authors, :is_retracted, :changed_at)
+            (job_id, paper_id, rev, title, authors, is_retracted, changed_at, seq)
+        VALUES (:job_id, :paper_id, :rev, :title, :authors, :is_retracted, :changed_at, :seq)
         ON CONFLICT(job_id, paper_id) DO UPDATE SET
             rev          = CASE
                              WHEN excluded.rev > staged_changes.rev THEN excluded.rev
@@ -213,7 +229,8 @@ def upsert_staged(conn: sqlite3.Connection, job_id: int, event: dict) -> None:
             changed_at   = CASE
                              WHEN excluded.rev > staged_changes.rev THEN excluded.changed_at
                              ELSE staged_changes.changed_at
-                           END
+                           END,
+            seq          = MAX(staged_changes.seq, excluded.seq)
         """,
         {
             "job_id": job_id,
@@ -223,6 +240,7 @@ def upsert_staged(conn: sqlite3.Connection, job_id: int, event: dict) -> None:
             "authors": event["authors"],
             "is_retracted": event["is_retracted"],
             "changed_at": event["changed_at"],
+            "seq": int(event.get("seq", 0)),
         },
     )
 

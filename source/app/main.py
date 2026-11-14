@@ -5,6 +5,17 @@ events over a closed [start, end] interval, paginated with opaque resumption
 cursors. Cursors have a short TTL and can also be invalidated globally via the
 control API, letting the collector demonstrate re-fetching the *original*
 interval instead of jumping to a newer cutoff.
+
+Arrival watermark
+-----------------
+Every accepted change is assigned a monotonically increasing arrival sequence
+``seq`` at ingestion time (independent of its business ``changed_at``, which
+may lie far in the past for late-delivered events). The global *watermark* is
+the highest assigned seq. ``GET /changes`` accepts an ``after_seq`` argument so
+collectors can catch up on late arrivals whose change time falls inside an
+interval already consumed, and every feed is pinned to a request-level
+``snapshot_seq``: pages resumed via the cursor always see exactly the same
+event set as page 1, even if new events arrive while paging is in progress.
 """
 from __future__ import annotations
 
@@ -19,13 +30,13 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .data import APPENDED_EVENTS, SEED_EVENTS
+from .data import APPENDED_EVENTS, LATE_BATCH_EVENTS, SEED_EVENTS
 
 PAGE_SIZE = int(os.getenv("SOURCE_PAGE_SIZE", "3"))
 CURSOR_TTL_SECONDS = int(os.getenv("CURSOR_TTL_SECONDS", "60"))
 SECRET = os.getenv("CURSOR_SECRET", "local-demo-secret").encode()
 
-app = FastAPI(title="Mock Institutional Repository Source", version="1.0.0")
+app = FastAPI(title="Mock Institutional Repository Source", version="2.0.0")
 _lock = threading.Lock()
 
 
@@ -34,7 +45,13 @@ _lock = threading.Lock()
 # --------------------------------------------------------------------------- #
 class _State:
     def __init__(self) -> None:
+        # Each appended row is a full event dict carrying its arrival seq.
         self.appended: list[dict] = []
+        # Monotonic arrival-sequence counter. Seed events own seq 1..N.
+        self.next_seq = len(SEED_EVENTS) + 1
+        # Events waiting to be ingested right after the next successful
+        # /changes response — deterministic "arrive while paging" demo.
+        self.pending_append: list[dict] = []
         # Bumped on forced cursor expiry; cursors signed under an older
         # generation are rejected even while inside their TTL.
         self.cursor_generation = 0
@@ -50,14 +67,36 @@ class _State:
 STATE = _State()
 
 
+def _seed_events_locked() -> list[dict]:
+    return [dict(e, seq=i + 1) for i, e in enumerate(SEED_EVENTS)]
+
+
+def _events_locked() -> list[dict]:
+    """Caller must already hold ``_lock`` (the lock is non-reentrant)."""
+    return _seed_events_locked() + list(STATE.appended)
+
+
 def _all_events() -> list[dict]:
     with _lock:
         return _events_locked()
 
 
-def _events_locked() -> list[dict]:
-    """Caller must already hold ``_lock`` (the lock is non-reentrant)."""
-    return list(SEED_EVENTS) + list(STATE.appended)
+def _watermark_locked() -> int:
+    """Highest arrival seq currently visible (0 on an empty feed)."""
+    events = _events_locked()
+    return int(events[-1]["seq"]) if events else 0
+
+
+def _append_locked(rows: list[dict]) -> int:
+    """Ingest rows under the lock, assigning the next monotonic arrival seq."""
+    added = 0
+    for row in rows:
+        event = dict(row)
+        event["seq"] = STATE.next_seq
+        STATE.next_seq += 1
+        STATE.appended.append(event)
+        added += 1
+    return added
 
 
 # --------------------------------------------------------------------------- #
@@ -68,12 +107,15 @@ def _sign(payload_b64: str, generation: int) -> str:
     return f"{generation}.{payload_b64}.{mac.hexdigest()}"
 
 
-def make_cursor(start: str, end: str, offset: int, page_size: int) -> str:
+def make_cursor(start: str, end: str, after_seq: int, offset: int,
+                page_size: int, snapshot_seq: int) -> str:
     payload = {
         "start": start,
         "end": end,
+        "after_seq": after_seq,
         "offset": offset,
         "page_size": page_size,
+        "snapshot_seq": snapshot_seq,
         "exp": datetime.now(timezone.utc).timestamp() + CURSOR_TTL_SECONDS,
     }
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
@@ -107,6 +149,17 @@ def parse_cursor(cursor: str) -> dict:
 # Schemas
 # --------------------------------------------------------------------------- #
 class ChangeEvent(BaseModel):
+    seq: int = Field(ge=1, description="monotonic arrival sequence assigned by the source")
+    paper_id: str
+    rev: int
+    title: str
+    authors: str
+    is_retracted: int = Field(ge=0, le=1)
+    changed_at: str
+
+
+class AppendEvent(BaseModel):
+    """Ingestion input: the source assigns seq, so callers never provide it."""
     paper_id: str
     rev: int
     title: str
@@ -123,10 +176,19 @@ class ChangesResponse(BaseModel):
     page_size: int
     total_matched: int
     done: bool
+    # Pinned snapshot of this feed: resumed pages never see events that arrived
+    # after page 1, so cursor/commit timing cannot permanently skip an event.
+    snapshot_seq: int
+    # The source's current high-water mark at response time (may exceed the
+    # snapshot when events arrived during paging).
+    watermark: int
+    after_seq: int
 
 
 class AppendRequest(BaseModel):
-    events: list[ChangeEvent]
+    events: list[AppendEvent] | None = Field(
+        None, description="events to ingest; arrival seq is assigned by the source"
+    )
 
 
 class FailRequest(BaseModel):
@@ -142,13 +204,39 @@ class ExpireAfterRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "events": len(_all_events()), "page_size": PAGE_SIZE}
+    with _lock:
+        watermark = _watermark_locked()
+    return {"status": "ok", "events": watermark, "watermark": watermark,
+            "page_size": PAGE_SIZE}
+
+
+@app.get("/watermark")
+def get_watermark() -> dict:
+    """Monotonic arrival high-water mark: max assigned arrival seq."""
+    with _lock:
+        return {"watermark": _watermark_locked()}
+
+
+def _matches(event: dict, start: str, end: str, after_seq: int) -> bool:
+    """Feed predicate.
+
+    Included when the change time is inside the closed [start, end] window,
+    OR the event arrived after the consumer's watermark while still not
+    exceeding the job cutoff. The second branch is the late-arrival catch-up:
+    it rescues events whose changed_at lies in an already-finished interval.
+    Events newer than ``end`` are deliberately excluded — a later job picks
+    them up once the cutoff catches up.
+    """
+    if event["changed_at"] > end:
+        return False
+    return event["changed_at"] >= start or int(event["seq"]) > after_seq
 
 
 @app.get("/changes", response_model=ChangesResponse)
 def get_changes(
     start: str = Query(..., description="closed interval start, ISO-8611 UTC"),
-    end: str = Query(..., description="closed interval end, ISO-8611 UTC"),
+    end: str = Query(..., description="closed interval end, ISO-8601 UTC"),
+    after_seq: int = Query(0, ge=0, description="arrival watermark already published by the consumer"),
     cursor: str | None = Query(None),
 ) -> ChangesResponse:
     # Deterministic fault injection for the disconnect demo.
@@ -164,19 +252,35 @@ def get_changes(
     page_size = PAGE_SIZE
     if cursor is None:
         offset = 0
+        # Pin the feed to the current snapshot: events arriving while paging
+        # is in flight get seq values above the snapshot and stay invisible to
+        # every page of THIS feed (they belong to a future job).
+        with _lock:
+            snapshot_seq = _watermark_locked()
     else:
         payload = parse_cursor(cursor)  # raises 410 when expired/invalid
-        if payload["start"] != start or payload["end"] != end:
-            # A cursor may only be resumed inside its original interval.
+        if (payload["start"] != start or payload["end"] != end
+                or int(payload["after_seq"]) != after_seq):
+            # A cursor may only be resumed inside its original feed (same
+            # interval, same arrival-watermark baseline).
             raise HTTPException(status_code=410, detail="cursor invalid or expired")
         offset = int(payload["offset"])
         page_size = int(payload["page_size"])
+        snapshot_seq = int(payload["snapshot_seq"])
 
-    matched = [e for e in _all_events() if start <= e["changed_at"] <= end]
+    with _lock:
+        # Snapshot view: only events visible at the pinned watermark.
+        snapshot_events = [e for e in _events_locked() if int(e["seq"]) <= snapshot_seq]
+        current_watermark = _watermark_locked()
+
+    matched = [e for e in snapshot_events if _matches(e, start, end, after_seq)]
     page_rows = matched[offset:offset + page_size]
     next_offset = offset + len(page_rows)
     done = next_offset >= len(matched)
-    next_cursor = None if done else make_cursor(start, end, next_offset, page_size)
+    next_cursor = (
+        None if done
+        else make_cursor(start, end, after_seq, next_offset, page_size, snapshot_seq)
+    )
     page = offset // page_size + 1 if page_size else 1
 
     response = ChangesResponse(
@@ -187,18 +291,26 @@ def get_changes(
         page_size=page_size,
         total_matched=len(matched),
         done=done,
+        snapshot_seq=snapshot_seq,
+        watermark=current_watermark,
+        after_seq=after_seq,
     )
 
-    # Deterministic cursor-expiry hook. The bump happens AFTER the response
-    # (and its cursor) has been built under the current generation, so the
-    # cursor handed out on this request is rejected only on the NEXT request:
-    # the collector durably checkpointed a page, then gets 410 and must
-    # re-fetch the original interval from offset 0.
+    # Post-response hooks run AFTER the response (and its cursor) has been
+    # built under the current generation/snapshot, so the side effects only
+    # affect subsequent requests.
     with _lock:
         if STATE.expire_after_requests > 0:
             STATE.expire_after_requests -= 1
             if STATE.expire_after_requests == 0:
                 STATE.cursor_generation += 1
+        # Deterministic "arrive while paging": ingest the queued events now.
+        # Their seq values exceed snapshot_seq, so this feed's later pages
+        # (bound to the snapshot) cannot return them; the next job's
+        # after_seq catch-up window is what guarantees delivery.
+        if STATE.pending_append:
+            _append_locked(STATE.pending_append)
+            STATE.pending_append = []
 
     return response
 
@@ -241,40 +353,77 @@ def control_append_batch() -> dict:
     """Append the prepared incremental batch (idempotent per demo run)."""
     with _lock:
         if not STATE.appended:
-            STATE.appended = [dict(e) for e in APPENDED_EVENTS]
-            added = len(STATE.appended)
+            added = _append_locked(APPENDED_EVENTS)
         else:
             added = 0
-        total = len(_events_locked())
-    return {"added": added, "total_events": total}
+        total = _watermark_locked()
+    return {"added": added, "watermark": total, "total_events": total}
+
+
+@app.post("/control/append-late-batch")
+def control_append_late_batch() -> dict:
+    """Append the prepared LATE-arrival batch (idempotent per demo run).
+
+    The retraction's changed_at is inside the already-synced interval; only
+    the arrival watermark lets the next job observe it.
+    """
+    with _lock:
+        marker = ("P0004", 2)
+        already = any(
+            (e["paper_id"], e["rev"]) == marker for e in STATE.appended
+        )
+        added = 0 if already else _append_locked(LATE_BATCH_EVENTS)
+        total = _watermark_locked()
+    return {"added": added, "watermark": total, "total_events": total}
 
 
 @app.post("/control/append")
 def control_append(req: AppendRequest) -> dict:
+    rows = [e.model_dump(exclude={"seq"}) for e in req.events] if req.events else []
     with _lock:
-        STATE.appended.extend(e.model_dump() for e in req.events)
-        total = len(_events_locked())
-    return {"total_events": total}
+        added = _append_locked(rows)
+        total = _watermark_locked()
+    return {"added": added, "watermark": total, "total_events": total}
+
+
+@app.post("/control/append-during-paging")
+def control_append_during_paging(req: AppendRequest) -> dict:
+    """Queue events to be ingested right after the next successful /changes.
+
+    Demonstrates that events arriving mid-pagination cannot be skipped by
+    cursor or commit timing: the pinned snapshot excludes them from this feed
+    while the next job's after_seq window guarantees they are collected.
+    """
+    rows = [e.model_dump(exclude={"seq"}) for e in req.events] if req.events else []
+    with _lock:
+        STATE.pending_append.extend(rows)
+        queued = len(STATE.pending_append)
+    return {"queued_for_next_feed_response": queued}
 
 
 @app.post("/control/reset")
 def control_reset() -> dict:
     with _lock:
         STATE.appended = []
+        STATE.pending_append = []
+        STATE.next_seq = len(SEED_EVENTS) + 1
         STATE.fail_next = 0
         STATE.cursor_generation = 0
         STATE.expire_after_requests = 0
         STATE.changes_calls = 0
-        total = len(_events_locked())
-    return {"status": "reset", "total_events": total}
+        total = _watermark_locked()
+    return {"status": "reset", "watermark": total, "total_events": total}
 
 
 @app.get("/control/state")
 def control_state() -> dict:
     with _lock:
         return {
-            "total_events": len(_events_locked()),
+            "total_events": _watermark_locked(),
+            "watermark": _watermark_locked(),
             "appended": len(STATE.appended),
+            "pending_append": len(STATE.pending_append),
+            "next_seq": STATE.next_seq,
             "fail_next": STATE.fail_next,
             "cursor_generation": STATE.cursor_generation,
             "expire_after_requests": STATE.expire_after_requests,
@@ -285,4 +434,4 @@ def control_state() -> dict:
 
 @app.get("/events")
 def list_events() -> dict:
-    return {"events": _all_events()}
+    return {"events": _all_events(), "watermark": _watermark_locked()}

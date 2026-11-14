@@ -19,6 +19,8 @@ class JobResponse(BaseModel):
     source_url: str
     interval_start: str
     interval_end: str
+    after_seq: int
+    snapshot_seq: int | None
     status: str
     cursor: str | None
     next_offset: int
@@ -36,6 +38,7 @@ class StateResponse(BaseModel):
     last_start: str | None
     last_end: str | None
     completed_at: str | None
+    watermark_seq: int
 
 
 class PaperResponse(BaseModel):
